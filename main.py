@@ -3,10 +3,13 @@
 import argparse
 import csv
 import io
+import logging
 import re
+import sys
 import unicodedata
 from collections import Counter
 from pathlib import Path
+from time import perf_counter
 from urllib.error import URLError
 from urllib.request import urlopen
 from zipfile import BadZipFile, ZipFile
@@ -34,6 +37,7 @@ DATASETS = {
     ),
 }
 DEFAULT_DATASET = "KOR_phishing_data_raw"
+logger = logging.getLogger(__name__)
 
 
 def read_messages(dataset, input_path):
@@ -45,9 +49,11 @@ def read_messages(dataset, input_path):
             input_path = local_csv
 
     if input_path is not None:
+        logger.info("[DATA] 데이터 읽는 중")
+        logger.debug("[DATA] path=%s", input_path.resolve())
         data = input_path.read_bytes()
     else:
-        print(f"{csv_name} 다운로드 중…", flush=True)
+        logger.info("[DATA] 데이터 다운로드 중")
         try:
             with urlopen(url, timeout=25) as response:
                 data = response.read()
@@ -71,19 +77,25 @@ def read_messages(dataset, input_path):
         raise ValueError("CSV에 content(본문)와 class(라벨) 열이 있어야 합니다.")
 
     rows = []
+    skipped = 0
     for row in reader:
         text = row["content"]
         source_label = (row["class"] or "").strip()
         if text and text.strip() and source_label in label_map:
             rows.append((text, label_map[source_label]))
+        else:
+            skipped += 1
 
     counts = Counter(label for _, label in rows)
-    print(f"{dataset}: 사용 가능한 원본 {len(rows):,}건")
-    print(f"라벨 분포: 정상 {counts[0]:,}건, 피싱 {counts[1]:,}건")
+    logger.debug(
+        "[DATA] loaded dataset=%s samples=%d normal=%d phishing=%d skipped=%d",
+        dataset, len(rows), counts[0], counts[1], skipped,
+    )
     return rows
 
 
 def split_messages(rows):
+    logger.info("[SPLIT] 데이터 정리 및 분리 중")
     # 공백이나 글자 표기만 다른 본문은 하나로 보고, 라벨이 서로 다른 중복은 제외한다.
     unique = {}
     for text, label in rows:
@@ -105,29 +117,31 @@ def split_messages(rows):
         labels.append(label)
 
     label_counts = Counter(labels)
-    if len(set(groups)) < 5 or min(label_counts[0], label_counts[1]) < 5:
+    group_count = len(set(groups))
+    if group_count < 5 or min(label_counts[0], label_counts[1]) < 5:
         raise ValueError("5개 그룹으로 나누려면 정상·피싱 예문과 서로 다른 문구가 충분히 필요합니다.")
 
     texts = np.asarray(texts, dtype=object)
     labels = np.asarray(labels)
+    logger.debug("[SPLIT] start samples=%d removed=%d groups=%d", len(texts), len(rows) - len(texts), group_count)
     splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
     folds = [held_out for _, held_out in splitter.split(texts, labels, groups)]
     test, validation = folds[:2]
     train = np.concatenate(folds[2:])
 
-    for name, indices in [("학습", train), ("검증·확률 보정", validation), ("최종 평가", test)]:
+    for name, indices in [("train", train), ("validation", validation), ("test", test)]:
         counts = Counter(labels[indices].tolist())
         if set(counts) != {0, 1}:
             raise ValueError(f"{name} 구간에 정상과 피싱 라벨이 모두 필요합니다.")
-        print(f"{name}: {len(indices):,}건 (정상 {counts[0]:,}, 피싱 {counts[1]:,})")
+        logger.debug("[SPLIT] set=%s samples=%d normal=%d phishing=%d", name, len(indices), counts[0], counts[1])
 
     return texts, labels, train, validation, test
 
 
 def train_and_evaluate(texts, labels, train, validation, test):
     candidates = {
-        "단어 빈도 + MultinomialNB": make_pipeline(CountVectorizer(), MultinomialNB()),
-        "글자 묶음 TF-IDF + ComplementNB": make_pipeline(
+        "CountVectorizer+MultinomialNB": make_pipeline(CountVectorizer(), MultinomialNB()),
+        "TfidfVectorizer+ComplementNB": make_pipeline(
             TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=2, sublinear_tf=True),
             ComplementNB(alpha=0.5),
         ),
@@ -135,42 +149,61 @@ def train_and_evaluate(texts, labels, train, validation, test):
 
     validation_scores = {}
     for name, candidate in candidates.items():
+        logger.info("[TRAIN] %s 학습 중", type(candidate[-1]).__name__)
+        started = perf_counter()
         candidate.fit(texts[train], labels[train])
         scores = candidate.predict_proba(texts[validation])[:, 1]
         validation_scores[name] = average_precision_score(labels[validation], scores)
-        print(f"검증 AP | {name} | {validation_scores[name]:.3f}")
+        feature_count = len(candidate[0].vocabulary_)
+        logger.debug(
+            "[TRAIN] done model=%s validation_ap=%.3f features=%d elapsed=%.1fs",
+            name, validation_scores[name], feature_count, perf_counter() - started,
+        )
 
     selected_name = max(validation_scores, key=validation_scores.get)
+    logger.debug("[TRAIN] selected model=%s validation_ap=%.3f", selected_name, validation_scores[selected_name])
+
+    logger.info("[CALIBRATE] 예측 확률 보정 중")
+    logger.debug("[CALIBRATE] method=sigmoid samples=%d", len(validation))
     # 학습된 분류기를 고정하고 검증 데이터로만 확률을 보정한다.
     model = CalibratedClassifierCV(FrozenEstimator(candidates[selected_name]), method="sigmoid")
     model.fit(texts[validation], labels[validation])
 
+    logger.info("[EVAL] 모델 성능 평가 중")
     scores = model.predict_proba(texts[test])[:, 1]
     predictions = model.predict(texts[test])
-    print(f"\n선택한 모델: {selected_name}")
-    print(f"최종 평가 AP: {average_precision_score(labels[test], scores):.3f}")
-    print(classification_report(
-        labels[test], predictions, labels=[0, 1], target_names=["정상", "피싱"], digits=3, zero_division=0,
-    ))
-    print("혼동 행렬(행은 실제, 열은 예측, 순서는 정상·피싱)")
-    print(confusion_matrix(labels[test], predictions, labels=[0, 1]))
+    report = classification_report(
+        labels[test], predictions, labels=[0, 1], target_names=["normal", "phishing"],
+        output_dict=True, zero_division=0,
+    )
+    logger.debug("[EVAL] ap=%.3f accuracy=%.3f", average_precision_score(labels[test], scores), report["accuracy"])
+    for label in ("normal", "phishing"):
+        metrics = report[label]
+        logger.debug(
+            "[EVAL] label=%s precision=%.3f recall=%.3f f1=%.3f support=%d",
+            label, metrics["precision"], metrics["recall"], metrics["f1-score"], metrics["support"],
+        )
+    true_normal, false_alarm, missed, detected = confusion_matrix(labels[test], predictions, labels=[0, 1]).ravel()
+    logger.debug("[EVAL] tn=%d fp=%d fn=%d tp=%d", true_normal, false_alarm, missed, detected)
     return model
 
 
 def save_model(model, output_path):
+    logger.info("[EXPORT] 모델 저장 중")
     examples = [
         "안녕하세요! 내일 학교 끝나고 도서관에서 만날까요?",
         "[광고] 오늘만 전 상품 할인! 무료 쿠폰을 신청하세요.",
         "[웹발신] 배송 주소 오류로 배송이 지연되었습니다. 주소를 확인해 주세요.",
     ]
     probabilities = model.predict_proba(examples)
-    for text, probability in zip(examples, probabilities[:, 1]):
-        print(f"> {text}\n[ 스팸 확률 : {probability:.1%} ]\n")
-
     joblib.dump(model, output_path, compress=3)
     reloaded = joblib.load(output_path)
     np.testing.assert_allclose(reloaded.predict_proba(examples), probabilities)
-    print(f"저장 완료: {output_path.resolve()} (scikit-learn {sklearn.__version__}, joblib {joblib.__version__})")
+    logger.info("[EXPORT] 저장 완료 · %s", output_path)
+    logger.debug(
+        "[EXPORT] saved path=%s verified_samples=%d scikit-learn=%s joblib=%s",
+        output_path.resolve(), len(examples), sklearn.__version__, joblib.__version__,
+    )
 
 
 def main():
@@ -183,6 +216,9 @@ def main():
     if args.output.resolve() == (args.input or Path(f"{args.dataset}.csv")).resolve():
         parser.error("학습 데이터와 모델 저장 경로는 달라야 합니다.")
 
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S", stream=sys.stdout,
+    )
     try:
         rows = read_messages(args.dataset, args.input)
         model = train_and_evaluate(*split_messages(rows))
